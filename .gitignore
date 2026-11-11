@@ -1,0 +1,5 @@
+/target
+**/*.rs.bk
+
+# Third-party installers and tools (not ours to redistribute)
+/tools/

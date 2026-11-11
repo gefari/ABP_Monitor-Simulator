@@ -1,0 +1,16 @@
+[target.thumbv7em-none-eabihf]
+# Flash, run, and stream defmt logs over RTT. The onboard probe runs SEGGER J-Link firmware.
+runner = "probe-rs run --chip STM32F746NGHx"
+# flip-link places the stack below .data/.bss so a stack overflow faults instead of corrupting memory.
+linker = "flip-link"
+rustflags = [
+  "-C", "link-arg=-Tlink.x",
+  "-C", "link-arg=-Tdefmt.x",
+  "-C", "link-arg=--nmagic",
+]
+
+[build]
+target = "thumbv7em-none-eabihf" # Cortex-M7F (STM32F746NG)
+
+[env]
+DEFMT_LOG = "debug"
