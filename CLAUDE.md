@@ -5,6 +5,9 @@ STM32746G-EVAL (STM32F746NG). It drives a Novanta LMDCE571 stepper motor (pressu
 Ethernet/MCode and will read an ABP pressure transducer through a TI ADS1256 ADC.
 Board setup, jumpers, wiring and toolchain: see `README.md`.
 
+Git remote: `origin` = https://github.com/gefari/ABP_Monitor-Simulator (branch `main`, HTTPS).
+The GitHub CLI `gh` is not installed on this PC; use plain `git push`/`git pull`.
+
 ## Working on the hardware
 
 - Build: `cargo build` (first full build takes ~6.5 min on this PC; incremental is seconds).
