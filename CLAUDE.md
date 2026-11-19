@@ -16,16 +16,25 @@ The GitHub CLI `gh` is not installed on this PC; use plain `git push`/`git pull`
   RTT in blocking mode and the log buffer fills (`DEFMT_LOG=debug`). After any capture that kills
   probe-rs, run `probe-rs reset --chip STM32F746NGHx`. The user sees this as "firmware is halt".
 - If probe-rs says "No connected probes", the ST-LINK USB is unplugged or unpowered; ask the user.
+  A charge-only USB cable gives the same symptom while the ST-LINK LED is lit: check that
+  `Get-PnpDevice -PresentOnly` lists VID_0483. "Target voltage (VAPP) is 0.00 V" = main board unpowered.
+- probe-rs here is the prebuilt GitHub release (`cargo install probe-rs-tools` needs MSYS2 `dlltool`,
+  which can't be installed because pacman fails TLS checks on this network). Smart App Control is off
+  on this PC; it blocked cargo build scripts (os error 4551).
+- To see logs without reflashing: `probe-rs attach --chip STM32F746NGHx target/thumbv7em-none-eabihf/debug/abp-simulator`
+  (then reset after killing it, as above).
 - Motor log shows `connection lost: Parse` with echoed commands → the motor's Echo Mode is not 2.
   `mcode::Client::connect` now forces `EM=2` on every connect (LMD Suite can change it).
   Don't keep LMD Suite connected to the motor at the same time.
 
-## Current state (2026-11-11)
+## Current state (2026-11-19)
 
 - Working on hardware: display, touch, Ethernet, motor run/stop (verified at 10 rpm).
-- ADS1256 driver (`src/ads1256.rs`) + ADC tab in the UI: **built, never run on hardware** (probe was
-  disconnected). Pinout in `src/ads1256.rs` and README. Runs on a high-priority `InterruptExecutor`
+- ADS1256 driver (`src/ads1256.rs`) + ADC tab in the UI: **verified on hardware 2026-11-19** (ID read,
+  self-cal, steady 1000 SPS with no missed DRDY; input still unconnected, reads a few mV of drift).
+  Pinout in `src/ads1256.rs` and README. Runs on a high-priority `InterruptExecutor`
   (UART4 IRQ) because frame draws block the main executor ~20 ms.
+  `ADS1256 not found (STATUS 0x00)` means DOUT never driven: module unpowered (5 V from CN5-60) or wiring.
 - Monitor tab waveform is a placeholder (two Gaussians, fixed 72 bpm 120/80), not driven by the ADC.
 - **Next step from the user**: they will say which ADS1256 input the ABP transducer is on; then set
   inputs/gain/scaling (mmHg) and show the measured pressure on the Monitor tab.
