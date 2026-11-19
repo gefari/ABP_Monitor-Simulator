@@ -35,9 +35,20 @@ The GitHub CLI `gh` is not installed on this PC; use plain `git push`/`git pull`
   Pinout in `src/ads1256.rs` and README. Runs on a high-priority `InterruptExecutor`
   (UART4 IRQ) because frame draws block the main executor ~20 ms.
   `ADS1256 not found (STATUS 0x00)` means DOUT never driven: module unpowered (5 V from CN5-60) or wiring.
-- Monitor tab waveform is a placeholder (two Gaussians, fixed 72 bpm 120/80), not driven by the ADC.
-- **Next step from the user**: they will say which ADS1256 input the ABP transducer is on; then set
-  inputs/gain/scaling (mmHg) and show the measured pressure on the Monitor tab.
+- ABP transducer on AIN0-AIN1 (gain 64), AINCOM tied to GND. Scaling 5 uV/V/mmHg at 5 V excitation
+  = 25 uV/mmHg; ZERO button on the Monitor tab. Monitor shows the measured waveform (autoscale with
+  AUTO button, or fixed 0-200 mmHg), SYS/DIA, MAP, HR (4 s window), AIN0/AIN1 voltages.
+- Two ADC modes, toggled at runtime by the MUX button on the ADC tab (`ads1256::set_mux`, default OFF):
+  - MUX OFF: AIN0-AIN1 only, continuous conversion at 1000 SPS (registers written once).
+  - MUX ON: 1 kHz slots, AIN0-AIN1 at DRATE 3750 + AIN0/AIN1 vs AINCOM at 100 SPS each.
+  Both verified on hardware 2026-11-19 (MUX ON: slot max ~956 us of 1000, a few late slots).
+- Hardware issue: ~7.5 % of SPI register writes get corrupted (SCLK ringing on jumper wires), so writes
+  are verified and retried (counter on the ADC tab). Hurts MUX ON only. Fix: shorter wires, GND next to
+  SCLK, 33-100 ohm series resistor at CN6-23. After a later re-wiring a 40 s run showed 0 retries.
+- Debug the MUX ON path without touching the screen: `probe-rs write --chip STM32F746NGHx b8 <addr> 1`
+  with the address of `ads1256::MUX_ON` from `llvm-nm` (in `~/.rustup/toolchains/*/lib/rustlib/*/bin`).
+- `JtagGetIdcodeError` with the board powered (LCD blank, chip not running) cleared after the user
+  reworked the ADS1256 wiring/power; check the module wiring and power-up order first when it appears.
 
 ## Regulatory documentation (IEC 62304)
 

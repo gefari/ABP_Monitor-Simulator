@@ -1,8 +1,10 @@
-//! Screen: a header with two tabs.
-//! - Monitor: scrolling arterial-pressure waveform with grid, numeric readouts. The waveform is
-//!   a placeholder shape (two Gaussians), not a physiological model yet.
+//! Screen: a header with three tabs.
+//! - Monitor: scrolling arterial-pressure waveform measured by the ADS1256 (AIN0-AIN1, mmHg),
+//!   SYS/DIA, MAP and HR from the last 4 s, the AIN0/AIN1 voltages (MUX ON only), ZERO, and AUTO
+//!   (autoscale on/off).
 //! - Motor Test: speed setpoint with -/+ (tap = 10 rpm, hold to repeat), Start and Stop.
-//! - ADC: ADS1256 settings (inputs, gain, data rate, buffer) with -/+, and the live reading.
+//! - ADC: MUX ON/OFF switch, ADS1256 channels, measured rates, last readings, slot timing and
+//!   register write retries.
 
 use core::fmt::Write;
 
@@ -14,7 +16,7 @@ use embedded_graphics::primitives::{Circle, Line, PrimitiveStyle, PrimitiveStyle
 use embedded_graphics::text::{Alignment, Text};
 use embassy_time::{Duration, Instant};
 
-use crate::ads1256::{self, AINCOM, GAINS, RATES};
+use crate::ads1256::{self, CH_AIN0, CH_AIN1};
 use crate::display::WIDTH;
 use crate::motor::{self, Command, MAX_RPM, MIN_RPM};
 use crate::touch::Touch;
@@ -36,20 +38,37 @@ const PLOT_X: i32 = 50;
 const PLOT_Y: i32 = 64;
 const PLOT_W: usize = 570;
 const PLOT_H: i32 = 240;
-const P_MAX: f32 = 200.0; // mmHg at top of panel
-const SWEEP_PX_PER_S: f32 = 150.0;
+const P_MAX: f32 = 200.0; // mmHg at top of panel when autoscale is off
+/// Autoscale: smallest grid step (so the full panel is never less than ~5 mmHg and sensor noise
+/// is not blown up) and the number of grid divisions aimed for.
+const AUTO_MIN_STEP: f32 = 1.0;
+const AUTO_DIVS: f32 = 5.0;
+const SWEEP_PX_PER_S: u32 = 150;
+
+// Pressure scaling: disposable ABP transducers are 5 uV/V/mmHg (AAMI BP22), excited at 5 V.
+const UV_PER_MMHG: f32 = 5.0 * 5.0;
+const CODES_PER_MMHG: f32 = UV_PER_MMHG / ads1256::DIFF_UV_PER_CODE;
+/// SYS/DIA/MAP/HR window: 4 s at 1000 SPS (well inside ads1256::RING_LEN).
+const STATS_SAMPLES: u32 = 4000;
+/// Below this pulse pressure no heart rate is shown.
+const MIN_PULSE_MMHG: f32 = 10.0;
+/// ZERO takes the mean of the last second.
+const ZERO_SAMPLES: u32 = 1000;
+
+// Monitor readouts and ZERO button
+const READOUT_Y: i32 = 322;
+const READOUT_W: u32 = 116;
+const READOUT_H: u32 = 104;
+const BTN_ZERO: Rectangle = Rectangle::new(Point::new(8, 436), Size::new(120, 38));
+const BTN_AUTO: Rectangle = Rectangle::new(Point::new(512, 436), Size::new(120, 38));
+
+// ADC page
+const BTN_MUX: Rectangle = Rectangle::new(Point::new(40, 270), Size::new(160, 46));
 
 // Header tabs
 const TAB_MONITOR: Rectangle = Rectangle::new(Point::new(280, 6), Size::new(110, 32));
 const TAB_MOTOR: Rectangle = Rectangle::new(Point::new(400, 6), Size::new(110, 32));
 const TAB_ADC: Rectangle = Rectangle::new(Point::new(520, 6), Size::new(110, 32));
-
-// ADC page: one row per setting, each with - value +
-const ADC_ROWS: usize = 5;
-const ADC_ROW_Y: i32 = 96;
-const ADC_ROW_PITCH: i32 = 56;
-const ADC_BTN: Size = Size::new(60, 46);
-const ADC_LABELS: [&str; ADC_ROWS] = ["Input +", "Input -", "Gain", "Data rate", "Buffer"];
 
 // Motor Test page
 const BTN_MINUS: Rectangle = Rectangle::new(Point::new(130, 130), Size::new(90, 90));
@@ -63,12 +82,6 @@ const RPM_DEFAULT: i32 = 60;
 const REPEAT_DELAY: Duration = Duration::from_millis(500);
 const REPEAT_EVERY: Duration = Duration::from_millis(100);
 
-pub struct Vitals {
-    pub hr_bpm: f32,
-    pub sys: f32,
-    pub dia: f32,
-}
-
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
     Monitor,
@@ -79,8 +92,10 @@ enum Tab {
 pub struct Ui {
     tab: Tab,
     rpm: i32,
-    /// ADS1256 settings as chosen here (sent to the ADC task on every change).
-    adc: ads1256::Config,
+    /// ADC code of the bridge output taken as 0 mmHg (ZERO button); None = not zeroed yet.
+    zero: Option<i32>,
+    /// Monitor vertical scale follows the visible trace (true) or is fixed 0..P_MAX.
+    autoscale: bool,
     /// Current touch point, if the screen is touched.
     touch: Option<Point>,
     /// When the -/+ button under the finger steps again.
@@ -93,7 +108,7 @@ fn hit(r: &Rectangle, p: Option<Point>) -> bool {
 
 impl Ui {
     pub fn new() -> Self {
-        Ui { tab: Tab::Monitor, rpm: RPM_DEFAULT, adc: ads1256::Config::DEFAULT, touch: None, next_repeat: None }
+        Ui { tab: Tab::Monitor, rpm: RPM_DEFAULT, zero: None, autoscale: true, touch: None, next_repeat: None }
     }
 
     /// Handles the latest touch state; call once per frame.
@@ -115,13 +130,18 @@ impl Ui {
                 self.tab = Tab::Adc;
             }
         }
-        if self.tab == Tab::Adc {
-            if pressed {
-                self.adc_press(p);
+        if self.tab == Tab::Monitor {
+            if pressed && hit(&BTN_ZERO, p) {
+                self.zero = mean_code(ZERO_SAMPLES).or(self.zero);
+            } else if pressed && hit(&BTN_AUTO, p) {
+                self.autoscale = !self.autoscale;
             }
             return;
         }
-        if self.tab != Tab::Motor {
+        if self.tab == Tab::Adc {
+            if pressed && hit(&BTN_MUX, p) {
+                ads1256::set_mux(!ads1256::mux());
+            }
             return;
         }
 
@@ -164,7 +184,7 @@ impl Ui {
         }
     }
 
-    pub fn draw<D: DrawTarget<Color = Rgb565>>(&self, d: &mut D, v: &Vitals, t: f32) -> Result<(), D::Error> {
+    pub fn draw<D: DrawTarget<Color = Rgb565>>(&self, d: &mut D) -> Result<(), D::Error> {
         d.clear(BG)?;
         Rectangle::new(Point::zero(), Size::new(WIDTH as u32, HEADER_H))
             .into_styled(PrimitiveStyle::with_fill(HEADER))
@@ -174,116 +194,109 @@ impl Ui {
         self.tab_button(d, &TAB_MOTOR, "Motor Test", Tab::Motor)?;
         self.tab_button(d, &TAB_ADC, "ADC", Tab::Adc)?;
         match self.tab {
-            Tab::Monitor => draw_monitor(d, v, t),
+            Tab::Monitor => self.draw_monitor(d),
             Tab::Motor => self.draw_motor(d),
             Tab::Adc => self.draw_adc(d),
         }
     }
 
-    /// Steps the setting under the finger (- or + of its row) and sends the new settings.
-    fn adc_press(&mut self, p: Option<Point>) {
-        let Some((row, step)) = (0..ADC_ROWS).find_map(|r| {
-            let (minus, _, plus) = adc_row(r);
-            if hit(&minus, p) {
-                Some((r, -1))
-            } else if hit(&plus, p) {
-                Some((r, 1))
-            } else {
-                None
-            }
-        }) else {
-            return;
-        };
-        let stepped = |v: u8, count: usize| (v as i32 + step).clamp(0, count as i32 - 1) as u8;
-        let old = self.adc;
-        let c = &mut self.adc;
-        match row {
-            0 => c.pos = stepped(c.pos, 8),
-            1 => c.neg = stepped(c.neg, AINCOM as usize + 1),
-            2 => c.gain = stepped(c.gain, GAINS.len()),
-            3 => c.rate = stepped(c.rate, RATES.len()),
-            _ => c.buffer = !c.buffer,
-        }
-        if self.adc != old {
-            ads1256::configure(self.adc);
-        }
-    }
-
     fn draw_adc<D: DrawTarget<Color = Rgb565>>(&self, d: &mut D) -> Result<(), D::Error> {
         let av = ads1256::view();
+        let running = av.status == ads1256::Status::Running;
         let small = MonoTextStyle::new(&FONT_10X20, LABEL);
         let white = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
 
         Text::new("ADS1256  SPI2", Point::new(40, 80), small).draw(d)?;
+        let warn = Rgb565::new(31, 40, 0);
         let (state, color) = match av.status {
             ads1256::Status::Starting => ("STARTING", LABEL),
-            ads1256::Status::NotFound => ("NOT FOUND", Rgb565::new(31, 40, 0)),
-            ads1256::Status::NoDrdy => ("NO DRDY", Rgb565::new(31, 40, 0)),
+            ads1256::Status::NotFound => ("NOT FOUND", warn),
+            ads1256::Status::NoDrdy => ("NO DRDY", warn),
+            ads1256::Status::WriteFail => ("WRITE FAIL", warn),
             ads1256::Status::Running => ("RUNNING", Rgb565::new(8, 60, 8)),
         };
         Text::with_alignment(state, Point::new(600, 80), MonoTextStyle::new(&FONT_10X20, color), Alignment::Right).draw(d)?;
 
-        let c = &self.adc;
-        for (r, label) in ADC_LABELS.iter().enumerate() {
-            let (minus, value, plus) = adc_row(r);
-            Text::new(label, Point::new(40, minus.top_left.y + 30), small).draw(d)?;
+        // One row per channel: inputs, gain, scheduled rate, measured rate, last value.
+        const COLS: [i32; 4] = [40, 200, 270, 360];
+        for (x, h) in COLS.iter().zip(["Inputs", "Gain", "Rate", "Read"]) {
+            Text::new(h, Point::new(*x, 130), small).draw(d)?;
+        }
+        Text::with_alignment("Value", Point::new(600, 130), small, Alignment::Right).draw(d)?;
+        for (i, (inputs, gain, rate, _)) in ads1256::channel_info(av.mux).iter().enumerate() {
+            let y = 168 + i as i32 * 34;
+            let on = *rate > 0;
+            Text::new(inputs, Point::new(COLS[0], y), if on { white } else { small }).draw(d)?;
+            if !on {
+                Text::new("off (MUX OFF)", Point::new(COLS[1], y), small).draw(d)?;
+                continue;
+            }
+            let mut g = Buf::<8>::new();
+            let _ = write!(g, "x{}", gain);
+            Text::new(g.as_str(), Point::new(COLS[1], y), white).draw(d)?;
+            let mut r = Buf::<8>::new();
+            let _ = write!(r, "{}/s", rate);
+            Text::new(r.as_str(), Point::new(COLS[2], y), white).draw(d)?;
+            let mut m = Buf::<8>::new();
             let mut v = Buf::<16>::new();
-            let (at_min, at_max) = match r {
-                0 => {
-                    write_input(&mut v, c.pos);
-                    (c.pos == 0, c.pos == 7)
-                }
-                1 => {
-                    write_input(&mut v, c.neg);
-                    (c.neg == 0, c.neg == AINCOM)
-                }
-                2 => {
-                    let _ = write!(v, "x{}", c.gain());
-                    (c.gain == 0, c.gain as usize == GAINS.len() - 1)
-                }
-                3 => {
-                    let _ = write!(v, "{} SPS", RATES[c.rate as usize].0);
-                    (c.rate == 0, c.rate as usize == RATES.len() - 1)
-                }
-                _ => {
-                    let _ = v.write_str(if c.buffer { "ON" } else { "OFF" });
-                    (false, false)
-                }
-            };
-            self.button(d, &minus, "", if at_min { DISABLED } else { ACCENT })?;
-            self.button(d, &plus, "", if at_max { DISABLED } else { ACCENT })?;
-            bar(d, minus.center(), 24, 6)?;
-            bar(d, plus.center(), 24, 6)?;
-            bar(d, plus.center(), 6, 24)?;
-            RoundedRectangle::with_equal_corners(value, Size::new(8, 8))
-                .into_styled(PrimitiveStyleBuilder::new().stroke_color(LABEL).stroke_width(2).fill_color(HEADER).build())
-                .draw(d)?;
-            centered(d, &value, v.as_str(), Rgb565::WHITE)?;
+            if running {
+                let _ = write!(m, "{}/s", av.sps[i]);
+                write_volts(&mut v, av.uv[i], 6);
+                let _ = v.write_str(" V");
+            } else {
+                let _ = m.write_str("-");
+                let _ = v.write_str("-");
+            }
+            Text::new(m.as_str(), Point::new(COLS[3], y), white).draw(d)?;
+            Text::with_alignment(v.as_str(), Point::new(600, y), white, Alignment::Right).draw(d)?;
         }
 
-        // Live reading
-        let y = ADC_ROW_Y + ADC_ROWS as i32 * ADC_ROW_PITCH + 24;
-        if av.status == ads1256::Status::Running {
-            let mut s = Buf::<24>::new();
-            let (sign, uv) = (if av.uv < 0 { "-" } else { "+" }, av.uv.unsigned_abs());
-            let _ = write!(s, "{}{}.{:06} V", sign, uv / 1_000_000, uv % 1_000_000);
-            Text::new(s.as_str(), Point::new(40, y), white).draw(d)?;
-            let mut k = Buf::<40>::new();
-            let _ = write!(k, "code {}  {} SPS read", av.code, av.sps);
-            Text::with_alignment(k.as_str(), Point::new(600, y), small, Alignment::Right).draw(d)?;
-            if av.config != self.adc {
-                Text::new("applying...", Point::new(40, y + 28), small).draw(d)?;
+        // MUX switch (shows the requested mode; the rows above show the one in effect).
+        let want = ads1256::mux();
+        self.button(d, &BTN_MUX, if want { "MUX ON" } else { "MUX OFF" }, if want { GREEN } else { ACCENT })?;
+        let hint = if want != av.mux {
+            "switching..."
+        } else if want {
+            "AIN0/AIN1-AINCOM sampled too"
+        } else {
+            "AIN0-AIN1 only, continuous"
+        };
+        Text::new(hint, Point::new(BTN_MUX.top_left.x + BTN_MUX.size.width as i32 + 16, BTN_MUX.center().y + 6), small)
+            .draw(d)?;
+
+        let y = 350;
+        if running {
+            let mut s = Buf::<48>::new();
+            if av.mux {
+                let _ = write!(s, "Slot time max {} us, late slots {}", av.slot_us_max, av.late);
+            } else {
+                let _ = s.write_str("Continuous conversion, no slots");
             }
+            Text::new(s.as_str(), Point::new(40, y), small).draw(d)?;
         } else {
             Text::new("No ADC: see src/ads1256.rs for wiring", Point::new(40, y), small).draw(d)?;
         }
-        Text::with_alignment(
-            "Range +-5 V / gain. Buffer on: inputs 0..3 V. Each change re-runs self-calibration.",
-            Point::new(WIDTH as i32 / 2, 470),
-            MonoTextStyle::new(&FONT_6X10, LABEL),
-            Alignment::Center,
-        )
-        .draw(d)?;
+        let mut w = Buf::<40>::new();
+        let _ = write!(w, "Register write retries {}", av.write_retries);
+        Text::new(w.as_str(), Point::new(40, y + 30), if av.write_retries > 0 { MonoTextStyle::new(&FONT_10X20, warn) } else { small })
+            .draw(d)?;
+
+        let note = MonoTextStyle::new(&FONT_6X10, LABEL);
+        let mode = if av.mux {
+            "MUX ON: 1 kHz slots convert AIN0-AIN1 (3750 SPS filter); every 10th also AIN0, 5 later AIN1 (15000)."
+        } else {
+            "MUX OFF: AIN0-AIN1 converts continuously with the 1000 SPS filter; registers written once."
+        };
+        for (k, line) in [
+            mode,
+            "Buffer on: inputs 0..3 V. AINCOM is tied to GND. Self-calibrated at gain 64.",
+            "Pressure: 25 uV/mmHg (5 uV/V/mmHg at 5 V). Write retries > 0: check the SCLK wiring.",
+        ]
+        .iter()
+        .enumerate()
+        {
+            Text::with_alignment(line, Point::new(WIDTH as i32 / 2, 430 + k as i32 * 16), note, Alignment::Center).draw(d)?;
+        }
         Ok(())
     }
 
@@ -378,19 +391,12 @@ impl Ui {
     }
 }
 
-/// The -, value and + rectangles of ADC settings row `r`.
-fn adc_row(r: usize) -> (Rectangle, Rectangle, Rectangle) {
-    let y = ADC_ROW_Y + r as i32 * ADC_ROW_PITCH;
-    (
-        Rectangle::new(Point::new(250, y), ADC_BTN),
-        Rectangle::new(Point::new(320, y), Size::new(160, ADC_BTN.height)),
-        Rectangle::new(Point::new(490, y), ADC_BTN),
-    )
-}
 
-/// ADS1256 input name: AIN0..AIN7 or AINCOM.
-fn write_input<const N: usize>(b: &mut Buf<N>, i: u8) {
-    let _ = if i == AINCOM { b.write_str("AINCOM") } else { write!(b, "AIN{}", i) };
+/// Microvolts as volts with `decimals` (4 or 6) digits, e.g. "2.5012" or "-0.000123".
+fn write_volts<const N: usize>(b: &mut Buf<N>, uv: i32, decimals: u32) {
+    let (sign, a) = (if uv < 0 { "-" } else { "" }, uv.unsigned_abs());
+    let frac = (a % 1_000_000) / 10u32.pow(6 - decimals);
+    let _ = write!(b, "{}{}.{:0w$}", sign, a / 1_000_000, frac, w = decimals as usize);
 }
 
 /// Text centred in a rectangle (FONT_10X20).
@@ -429,80 +435,229 @@ impl<const N: usize> Write for Buf<N> {
 // ---------------------------------------------------------------------------------------------
 // Monitor tab
 
-fn gauss(x: f32, c: f32, w: f32) -> f32 {
-    let d = (x - c) / w;
-    libm::expf(-0.5 * d * d)
+/// Mean code of the last `n` pressure samples, if the ADC is running and has that many.
+fn mean_code(n: u32) -> Option<i32> {
+    let head = ads1256::head();
+    if ads1256::view().status != ads1256::Status::Running || head < n {
+        return None;
+    }
+    let sum: i64 = (head - n..head).map(|i| ads1256::sample(i) as i64).sum();
+    Some((sum / n as i64) as i32)
 }
 
-/// Placeholder ABP shape: systolic peak + dicrotic wave, scaled between dia and sys.
-fn pressure(v: &Vitals, t: f32) -> (f32, f32) {
-    let phase = libm::fmodf(t * v.hr_bpm / 60.0, 1.0);
-    let shape = gauss(phase, 0.15, 0.06) + 0.35 * gauss(phase, 0.40, 0.05);
-    (v.dia + (v.sys - v.dia) * shape.min(1.0), phase)
+/// Pressure figures over the last STATS_SAMPLES samples (mmHg, bpm).
+struct Vitals {
+    sys: f32,
+    dia: f32,
+    /// Mean of the waveform over the window (the window is not a whole number of beats, so
+    /// this moves a little with the beat phase).
+    map: f32,
+    hr: Option<u32>,
 }
 
-fn y_of(p: f32) -> i32 {
-    PLOT_Y + PLOT_H - (p / P_MAX * PLOT_H as f32) as i32
+fn vitals(head: u32, mmhg: &impl Fn(u32) -> f32) -> Option<Vitals> {
+    if head < STATS_SAMPLES {
+        return None;
+    }
+    let start = head - STATS_SAMPLES;
+    let (mut sys, mut dia, mut sum) = (f32::MIN, f32::MAX, 0.0f32);
+    for i in start..head {
+        let p = mmhg(i);
+        sys = sys.max(p);
+        dia = dia.min(p);
+        sum += p;
+    }
+    // Heart rate: rising crossings of 60 % of the pulse pressure, re-armed below 40 %.
+    let pp = sys - dia;
+    let mut hr = None;
+    if pp >= MIN_PULSE_MMHG {
+        let (hi, lo) = (dia + 0.6 * pp, dia + 0.4 * pp);
+        let (mut armed, mut first, mut last, mut beats) = (false, 0u32, 0u32, 0u32);
+        for i in start..head {
+            let p = mmhg(i);
+            if p < lo {
+                armed = true;
+            } else if armed && p > hi {
+                armed = false;
+                if beats == 0 {
+                    first = i;
+                }
+                last = i;
+                beats += 1;
+            }
+        }
+        if beats >= 2 {
+            hr = Some((beats - 1) * 60 * ads1256::DIFF_SPS / (last - first));
+        }
+    }
+    Some(Vitals { sys, dia, map: sum / STATS_SAMPLES as f32, hr })
 }
 
-fn readout<D: DrawTarget<Color = Rgb565>>(d: &mut D, x: i32, label: &str, value: &str, unit: &str) -> Result<(), D::Error> {
+/// Vertical scale of the waveform panel: `lo`..`hi` mmHg with a grid line every `step`.
+#[derive(Clone, Copy)]
+struct Scale {
+    lo: f32,
+    hi: f32,
+    step: f32,
+}
+
+impl Scale {
+    const FIXED: Scale = Scale { lo: 0.0, hi: P_MAX, step: 40.0 };
+
+    /// Range covering `min..max` with 1-2-5 grid steps, limits on grid lines. Snapping to the
+    /// grid keeps the scale from jumping every frame as the trace scrolls.
+    fn fit(min: f32, max: f32) -> Scale {
+        let raw = ((max - min) / AUTO_DIVS).max(AUTO_MIN_STEP);
+        let mag = libm::powf(10.0, libm::floorf(libm::log10f(raw)));
+        let step = [1.0, 2.0, 5.0, 10.0].iter().map(|m| m * mag).find(|s| *s >= raw).unwrap_or(10.0 * mag);
+        let mut lo = libm::floorf(min / step) * step;
+        let mut hi = libm::ceilf(max / step) * step;
+        if hi - lo < step * 2.0 {
+            // Flat trace: keep it in the middle of a two-division panel.
+            lo -= step;
+            hi = lo + step * 3.0;
+        }
+        Scale { lo, hi, step }
+    }
+
+    fn y(&self, p: f32) -> i32 {
+        let f = (p - self.lo) / (self.hi - self.lo);
+        (PLOT_Y + PLOT_H - (f * PLOT_H as f32) as i32).clamp(PLOT_Y, PLOT_Y + PLOT_H)
+    }
+}
+
+/// Readout box number `slot` (0..5) along the bottom of the Monitor tab.
+fn readout<D: DrawTarget<Color = Rgb565>>(d: &mut D, slot: i32, label: &str, value: &str, unit: &str) -> Result<(), D::Error> {
+    let x = 8 + slot * (READOUT_W as i32 + 10);
+    let cx = x + READOUT_W as i32 / 2;
     let style = PrimitiveStyleBuilder::new().stroke_color(LABEL).stroke_width(2).fill_color(HEADER).build();
-    RoundedRectangle::with_equal_corners(Rectangle::new(Point::new(x, 330), Size::new(180, 120)), Size::new(12, 12))
+    RoundedRectangle::with_equal_corners(Rectangle::new(Point::new(x, READOUT_Y), Size::new(READOUT_W, READOUT_H)), Size::new(12, 12))
         .into_styled(style)
         .draw(d)?;
     let small = MonoTextStyle::new(&FONT_10X20, LABEL);
     let big = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
-    Text::new(label, Point::new(x + 14, 360), small).draw(d)?;
-    Text::with_alignment(value, Point::new(x + 90, 400), big, Alignment::Center).draw(d)?;
-    Text::with_alignment(unit, Point::new(x + 90, 430), small, Alignment::Center).draw(d)?;
+    Text::new(label, Point::new(x + 10, READOUT_Y + 26), small).draw(d)?;
+    Text::with_alignment(value, Point::new(cx, READOUT_Y + 62), big, Alignment::Center).draw(d)?;
+    Text::with_alignment(unit, Point::new(cx, READOUT_Y + 92), small, Alignment::Center).draw(d)?;
     Ok(())
 }
 
-fn draw_monitor<D: DrawTarget<Color = Rgb565>>(d: &mut D, v: &Vitals, t: f32) -> Result<(), D::Error> {
-    // Grid every 40 mmHg with labels
-    let label_style = MonoTextStyle::new(&FONT_6X10, LABEL);
-    for p in (0..=200).step_by(40) {
-        let y = y_of(p as f32);
-        Line::new(Point::new(PLOT_X, y), Point::new(PLOT_X + PLOT_W as i32 - 1, y))
-            .into_styled(PrimitiveStyle::with_stroke(GRID, 1))
+impl Ui {
+    fn draw_monitor<D: DrawTarget<Color = Rgb565>>(&self, d: &mut D) -> Result<(), D::Error> {
+        let av = ads1256::view();
+        let running = av.status == ads1256::Status::Running;
+        let head = ads1256::head();
+        let zero = self.zero.unwrap_or(0);
+        let mmhg = |i: u32| (ads1256::sample(i) - zero) as f32 / CODES_PER_MMHG;
+        let small = MonoTextStyle::new(&FONT_10X20, LABEL);
+        let span = PLOT_W as u32 * ads1256::DIFF_SPS / SWEEP_PX_PER_S;
+        let have_trace = running && head > span;
+
+        // Vertical scale: fixed 0..200 mmHg, or fitted to what is on screen.
+        let scale = if self.autoscale && have_trace {
+            let (min, max) = (head - span - 1..head)
+                .map(mmhg)
+                .fold((f32::MAX, f32::MIN), |(lo, hi), p| (lo.min(p), hi.max(p)));
+            Scale::fit(min, max)
+        } else {
+            Scale::FIXED
+        };
+
+        // Grid with labels
+        let label_style = MonoTextStyle::new(&FONT_6X10, LABEL);
+        let n = libm::roundf((scale.hi - scale.lo) / scale.step) as i32;
+        for k in 0..=n {
+            let p = scale.lo + k as f32 * scale.step;
+            let y = scale.y(p);
+            Line::new(Point::new(PLOT_X, y), Point::new(PLOT_X + PLOT_W as i32 - 1, y))
+                .into_styled(PrimitiveStyle::with_stroke(GRID, 1))
+                .draw(d)?;
+            let mut s = Buf::<6>::new();
+            let _ = write!(s, "{}", libm::roundf(p) as i32);
+            Text::with_alignment(s.as_str(), Point::new(PLOT_X - 8, y + 4), label_style, Alignment::Right).draw(d)?;
+        }
+        Text::new("mmHg", Point::new(8, PLOT_Y - 8), label_style).draw(d)?;
+
+        // Scrolling trace, rightmost column is "now". Each column covers 1000 / 150 = 6-7
+        // samples and is drawn as one 2-px-wide vertical span from the previous column's last
+        // sample through its own min..max (much cheaper than a thick Polyline).
+        if have_trace {
+            let first = |col: u32| head - (PLOT_W as u32 - col) * ads1256::DIFF_SPS / SWEEP_PX_PER_S;
+            let mut prev = scale.y(mmhg(first(0) - 1));
+            for col in 0..PLOT_W as u32 {
+                let (mut top, mut bot) = (prev, prev);
+                for i in first(col)..first(col + 1) {
+                    prev = scale.y(mmhg(i));
+                    top = top.min(prev);
+                    bot = bot.max(prev);
+                }
+                d.fill_solid(
+                    &Rectangle::new(Point::new(PLOT_X + col as i32, top), Size::new(2, (bot - top + 2) as u32)),
+                    TRACE,
+                )?;
+            }
+        } else {
+            let msg = if running { "Collecting samples..." } else { "No pressure signal: ADC not running (see ADC tab)" };
+            Text::with_alignment(msg, Point::new(PLOT_X + PLOT_W as i32 / 2, PLOT_Y + PLOT_H / 2), small, Alignment::Center)
+                .draw(d)?;
+        }
+
+        // Readouts
+        let vit = if running { vitals(head, &mmhg) } else { None };
+        let mut hr = Buf::<8>::new();
+        let mut sd = Buf::<16>::new();
+        let mut map = Buf::<8>::new();
+        match &vit {
+            Some(v) => {
+                let _ = match v.hr {
+                    Some(b) => write!(hr, "{}", b),
+                    None => hr.write_str("--"),
+                };
+                let _ = write!(sd, "{}/{}", libm::roundf(v.sys) as i32, libm::roundf(v.dia) as i32);
+                let _ = write!(map, "{}", libm::roundf(v.map) as i32);
+            }
+            None => {
+                let _ = hr.write_str("--");
+                let _ = sd.write_str("--/--");
+                let _ = map.write_str("--");
+            }
+        }
+        let mut a0 = Buf::<12>::new();
+        let mut a1 = Buf::<12>::new();
+        if running && av.mux {
+            write_volts(&mut a0, av.uv[CH_AIN0], 4);
+            write_volts(&mut a1, av.uv[CH_AIN1], 4);
+        } else if running {
+            let _ = a0.write_str("off");
+            let _ = a1.write_str("off");
+        } else {
+            let _ = a0.write_str("--");
+            let _ = a1.write_str("--");
+        }
+        readout(d, 0, "HR", hr.as_str(), "bpm")?;
+        readout(d, 1, "SYS/DIA", sd.as_str(), "mmHg")?;
+        readout(d, 2, "MAP", map.as_str(), "mmHg")?;
+        readout(d, 3, "AIN0", a0.as_str(), "V")?;
+        readout(d, 4, "AIN1", a1.as_str(), "V")?;
+
+        // Beat indicator in the HR box: lit while the pressure is above the pulse midpoint.
+        let beat = vit.as_ref().is_some_and(|v| v.hr.is_some() && mmhg(head - 1) > (v.sys + v.dia) / 2.0);
+        Circle::new(Point::new(8 + READOUT_W as i32 - 30, READOUT_Y + 12), 18)
+            .into_styled(PrimitiveStyle::with_fill(if beat { TRACE } else { GRID }))
             .draw(d)?;
-        let mut s = Buf::<4>::new();
-        let _ = write!(s, "{}", p);
-        Text::with_alignment(s.as_str(), Point::new(PLOT_X - 8, y + 4), label_style, Alignment::Right).draw(d)?;
+
+        // ZERO
+        self.button(d, &BTN_ZERO, "ZERO", if running { ACCENT } else { DISABLED })?;
+        let mut z = Buf::<48>::new();
+        let _ = match self.zero {
+            None => z.write_str("Not zeroed: vent to air, press ZERO"),
+            Some(c) => write!(z, "Zero offset {} uV", (c as f32 * ads1256::DIFF_UV_PER_CODE) as i32),
+        };
+        Text::new(z.as_str(), Point::new(BTN_ZERO.top_left.x + 136, BTN_ZERO.center().y + 6), small).draw(d)?;
+
+        // Autoscale toggle
+        let (label, fill) = if self.autoscale { ("AUTO", GREEN) } else { ("0-200", ACCENT) };
+        self.button(d, &BTN_AUTO, label, fill)?;
+        Ok(())
     }
-    Text::new("mmHg", Point::new(8, PLOT_Y - 8), label_style).draw(d)?;
-
-    // Scrolling trace, rightmost column is "now". Drawn as one 2-px-wide vertical span per
-    // column joining the previous sample (much cheaper than a thick Polyline).
-    let mut prev = y_of(pressure(v, t - PLOT_W as f32 / SWEEP_PX_PER_S).0);
-    for i in 0..PLOT_W {
-        let ts = t - (PLOT_W - 1 - i) as f32 / SWEEP_PX_PER_S;
-        let y = y_of(pressure(v, ts).0);
-        let (top, bot) = (prev.min(y), prev.max(y));
-        d.fill_solid(
-            &Rectangle::new(Point::new(PLOT_X + i as i32, top), Size::new(2, (bot - top + 2) as u32)),
-            TRACE,
-        )?;
-        prev = y;
-    }
-
-    // Readouts
-    let map = v.dia + (v.sys - v.dia) / 3.0;
-    let mut hr = Buf::<8>::new();
-    let _ = write!(hr, "{}", v.hr_bpm as u32);
-    let mut sd = Buf::<12>::new();
-    let _ = write!(sd, "{}/{}", v.sys as u32, v.dia as u32);
-    let mut m = Buf::<8>::new();
-    let _ = write!(m, "{}", map as u32);
-    readout(d, 20, "HR", hr.as_str(), "bpm")?;
-    readout(d, 230, "SYS/DIA", sd.as_str(), "mmHg")?;
-    readout(d, 440, "MAP", m.as_str(), "mmHg")?;
-
-    // Beat indicator: lit during systole.
-    let (_, phase) = pressure(v, t);
-    let heart = if phase < 0.3 { TRACE } else { GRID };
-    Circle::new(Point::new(170, 342), 18)
-        .into_styled(PrimitiveStyle::with_fill(heart))
-        .draw(d)?;
-    Ok(())
 }

@@ -190,17 +190,14 @@ async fn main(spawner: Spawner) {
     spawner.spawn(blink(p.PF10.into(), 500).unwrap());
     spawner.spawn(blink(p.PB7.into(), 1000).unwrap());
 
-    let vitals = ui::Vitals { hr_bpm: 72.0, sys: 120.0, dia: 80.0 };
-    let start = Instant::now();
     let mut window = Instant::now();
     let (mut frames, mut draw_us_max) = (0u32, 0u64);
     let mut screen = ui::Ui::new();
     loop {
         screen.update(touch::current());
 
-        let t = start.elapsed().as_micros() as f32 / 1e6;
         let t_draw = Instant::now();
-        let _ = screen.draw(&mut disp.back(), &vitals, t);
+        let _ = screen.draw(&mut disp.back());
         draw_us_max = draw_us_max.max(t_draw.elapsed().as_micros());
         if let Err(e) = disp.swap().await {
             warn!("LTDC swap error: {}", e);
