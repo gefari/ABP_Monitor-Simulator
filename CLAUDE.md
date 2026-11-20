@@ -37,16 +37,24 @@ The GitHub CLI `gh` is not installed on this PC; use plain `git push`/`git pull`
   `ADS1256 not found (STATUS 0x00)` means DOUT never driven: module unpowered (5 V from CN5-60) or wiring.
 - ABP transducer on AIN0-AIN1 (gain 64), AINCOM tied to GND. Scaling 5 uV/V/mmHg at 5 V excitation
   = 25 uV/mmHg; ZERO button on the Monitor tab. Monitor shows the measured waveform (autoscale with
-  AUTO button, or fixed 0-200 mmHg), SYS/DIA, MAP, HR (4 s window), AIN0/AIN1 voltages.
-- Two ADC modes, toggled at runtime by the MUX button on the ADC tab (`ads1256::set_mux`, default OFF):
-  - MUX OFF: AIN0-AIN1 only, continuous conversion at 1000 SPS (registers written once).
-  - MUX ON: 1 kHz slots, AIN0-AIN1 at DRATE 3750 + AIN0/AIN1 vs AINCOM at 100 SPS each.
-  Both verified on hardware 2026-11-19 (MUX ON: slot max ~956 us of 1000, a few late slots).
+  AUTO button, or fixed 0-200 mmHg), time window 100 ms..12 s with time axis, SYS/DIA, MAP, HR
+  (4 s window), voltages of the pair's inputs vs COM.
+- ADC settings, changed at runtime on the ADC tab (`ads1256::set_settings`; any change restarts with a
+  new self-cal): differential pair IN+/IN- (AIN0..7, COM; default AIN0-AIN1), gain 1..64 (default 64),
+  rate 5..7500 SPS (MUX OFF only, default 1000), and the mode:
+  - MUX OFF: the pair only, continuous conversion at the selected rate (registers written once).
+  - MUX ON: 1 kHz slots, the pair at DRATE 3750 + IN+/IN- vs AINCOM at 100 SPS each.
+  Verified on hardware 2026-11-20: 5, 1000, 7500 SPS (7500: UI drops to ~12 fps), MUX ON slot max
+  ~956 us of 1000. Diff samples are stored scaled to gain 64 (`code << (6 - pga)`), so pressure
+  scale and ZERO survive gain changes. ADC tab shows Value / Peak-Peak / StdDev (diff in uV,
+  single-ended in mV) over the Monitor window.
 - Hardware issue: ~7.5 % of SPI register writes get corrupted (SCLK ringing on jumper wires), so writes
   are verified and retried (counter on the ADC tab). Hurts MUX ON only. Fix: shorter wires, GND next to
   SCLK, 33-100 ohm series resistor at CN6-23. After a later re-wiring a 40 s run showed 0 retries.
-- Debug the MUX ON path without touching the screen: `probe-rs write --chip STM32F746NGHx b8 <addr> 1`
-  with the address of `ads1256::MUX_ON` from `llvm-nm` (in `~/.rustup/toolchains/*/lib/rustlib/*/bin`).
+- Change ADC settings without touching the screen: `probe-rs write --chip STM32F746NGHx b32 <addr> <word>`
+  with the address of `ads1256::SETTINGS` from `llvm-nm` (in `~/.rustup/toolchains/*/lib/rustlib/*/bin`).
+  Word = mux | pos<<4 | neg<<8 | pga<<12 | rate_index<<16; default 0x00096100. `probe-rs reset`
+  did NOT restore the default here (value survived), so write the default back after testing.
 - `JtagGetIdcodeError` with the board powered (LCD blank, chip not running) cleared after the user
   reworked the ADS1256 wiring/power; check the module wiring and power-up order first when it appears.
 

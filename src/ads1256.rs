@@ -16,13 +16,16 @@
 //! Assumes the usual breakout module: 7.68 MHz crystal, 2.5 V reference, AINCOM tied to GND.
 //! Full scale is +-5 V / gain; with the input buffer on, inputs must stay within 0..AVDD-2 V.
 //!
-//! Two modes, switched at run time from the ADC tab (`set_mux`):
-//! - MUX OFF (default): only the transducer bridge, AIN0 (+) vs AIN1 (-), gain 64, converting
-//!   continuously with the 1000 SPS filter. The registers are written once at start.
+//! The ADC tab selects (`set_settings`) the differential input pair (default AIN0 (+) vs AIN1
+//! (-), the transducer bridge), its gain (1..64, default 64), the data rate (MUX OFF only,
+//! 5..7500 SPS, default 1000) and one of two modes:
+//! - MUX OFF (default): only the differential pair, converting continuously at the selected
+//!   rate. The registers are written once at start.
 //! - MUX ON: one ADC behind the input multiplexer, so the channels take turns. A 1 kHz ticker
-//!   starts every slot with SYNC + WAKEUP on AIN0-AIN1 (gain 64, 3750 SPS filter), so pressure
-//!   samples are exactly 1 ms apart. In every 10th slot AIN0 vs AINCOM is converted right after
-//!   it, and 5 slots later AIN1 vs AINCOM (gain 1, 15000 SPS filter): 100 SPS each.
+//!   starts every slot with SYNC + WAKEUP on the pair (3750 SPS filter), so pressure samples are
+//!   exactly 1 ms apart. In every 10th slot the positive input vs AINCOM is converted right
+//!   after it, and 5 slots later the negative input vs AINCOM (gain 1, 15000 SPS filter): 100
+//!   SPS each.
 //!   After a multiplexer change the ADS1256 settles in one conversion (datasheet "Settling Time
 //!   Using the Input Multiplexer"): t18 = 0.44 ms at 3750 SPS and 0.25 ms at 15000 SPS
 //!   (table 13), so both fit in one slot. The next channel is selected before the previous
@@ -37,7 +40,7 @@
 
 use core::cell::Cell;
 use core::convert::Infallible;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 use defmt::{info, warn, Format};
 use embassy_stm32::exti::ExtiInput;
@@ -77,61 +80,131 @@ const ID_ADS1256: u8 = 3;
 /// Register write attempts before giving up.
 const WRITE_TRIES: u32 = 4;
 
-const AINCOM: u8 = 8;
 
 /// One input setting: the MUX, ADCON and DRATE register values.
+#[derive(Clone, Copy)]
 struct Channel {
     mux: u8,
     /// PGA code in ADCON[2:0]; CLKOUT and sensor detect are off.
     adcon: u8,
     drate: u8,
-    gain: u16,
 }
 
-/// Transducer bridge, AIN0 (+) vs AIN1 (-), gain 64 (+-78 mV): continuous, 1000 SPS filter.
-const DIFF_CONT: Channel = Channel { mux: 0 << 4 | 1, adcon: 6, drate: 0xA1, gain: 64 };
-/// The same in MUX ON slots: 3750 SPS filter so a second conversion fits in the slot.
-const DIFF_SLOT: Channel = Channel { mux: 0 << 4 | 1, adcon: 6, drate: 0xC0, gain: 64 };
-/// Single-ended AIN0 / AIN1 vs AINCOM (GND): gain 1, 15000 SPS filter.
-const AIN0_SE: Channel = Channel { mux: 0 << 4 | AINCOM, adcon: 0, drate: 0xE0, gain: 1 };
-const AIN1_SE: Channel = Channel { mux: 1 << 4 | AINCOM, adcon: 0, drate: 0xE0, gain: 1 };
+/// MUX ON: differential filter, 3750 SPS so a second conversion fits in the 1 ms slot.
+const DRATE_SLOT: u8 = 0xC0;
+/// MUX ON: single-ended filter (gain 1, 15000 SPS).
+const DRATE_SE: u8 = 0xE0;
 
-/// Differential (pressure) sample rate in both modes.
-pub const DIFF_SPS: u32 = 1000;
-/// MUX ON: each single-ended input is converted once every this many slots.
+/// Selectable differential data rates in MUX OFF: (samples/s, DRATE code), datasheet table 13.
+/// Above 7500 SPS one read per DRDY no longer fits comfortably with SCLK at 1.69 MHz.
+pub const RATES: [(u32, u8); 13] = [
+    (5, 0x13),
+    (10, 0x23),
+    (15, 0x33),
+    (25, 0x43),
+    (30, 0x53),
+    (50, 0x63),
+    (60, 0x72),
+    (100, 0x82),
+    (500, 0x92),
+    (1000, 0xA1),
+    (2000, 0xB0),
+    (3750, 0xC0),
+    (7500, 0xD0),
+];
+const RATE_DEFAULT: u8 = 9; // 1000 SPS
+
+/// MUX ON: slots per second (= differential samples/s) and single-ended rate divider.
+pub const SLOT_HZ: u32 = 1000;
 const SE_EVERY: u32 = 10;
-/// Microvolts per code of the differential channel (gain 64 in both modes).
-pub const DIFF_UV_PER_CODE: f32 = 2.0 * VREF_UV as f32 / (DIFF_CONT.gain as f32 * (1u32 << 23) as f32);
 
-/// Channel indices in `View`.
+/// Input code for AINCOM in the MUX register; 0..7 are AIN0..AIN7.
+pub const AINCOM: u8 = 8;
+/// Highest PGA code: gain 2^6 = 64.
+pub const PGA_MAX: u8 = 6;
+
+/// Differential samples are stored scaled to gain 64 (`code << (6 - pga)`, at most 2^29), so
+/// the pressure scale and the ZERO offset stay valid when the gain changes. Microvolts per
+/// stored unit:
+pub const DIFF_UV_PER_CODE: f32 = 2.0 * VREF_UV as f32 / (64.0 * (1u32 << 23) as f32);
+
+/// Channel indices in `View` and `RINGS`: the differential pair, then its positive and its
+/// negative input vs AINCOM (MUX ON only).
 pub const CH_DIFF: usize = 0;
 pub const CH_AIN0: usize = 1;
 pub const CH_AIN1: usize = 2;
 
-/// For display, per channel index: inputs, gain, scheduled samples/s (0 = not sampled),
-/// filter setting in SPS.
-pub fn channel_info(mux: bool) -> [(&'static str, u16, u32, u32); 3] {
-    if mux {
-        [
-            ("AIN0-AIN1", DIFF_SLOT.gain, DIFF_SPS, 3750),
-            ("AIN0-AINCOM", AIN0_SE.gain, DIFF_SPS / SE_EVERY, 15000),
-            ("AIN1-AINCOM", AIN1_SE.gain, DIFF_SPS / SE_EVERY, 15000),
-        ]
-    } else {
-        [("AIN0-AIN1", DIFF_CONT.gain, DIFF_SPS, 1000), ("AIN0-AINCOM", 0, 0, 0), ("AIN1-AINCOM", 0, 0, 0)]
+/// Everything the ADC tab can change. Changing any of it restarts sampling (with a new
+/// self-calibration).
+#[derive(Clone, Copy, PartialEq, Eq, Format)]
+pub struct Settings {
+    /// MUX ON (true): 1 kHz slots with the single-ended inputs; OFF: differential only.
+    pub mux: bool,
+    /// Differential inputs, 0..7 = AIN0..AIN7, 8 = AINCOM; never equal.
+    pub pos: u8,
+    pub neg: u8,
+    /// Differential PGA code 0..=6 (gain 1..64).
+    pub pga: u8,
+    /// Index into RATES (MUX OFF only; MUX ON always runs at SLOT_HZ).
+    pub rate: u8,
+}
+
+impl Settings {
+    const DEFAULT: Settings = Settings { mux: false, pos: 0, neg: 1, pga: PGA_MAX, rate: RATE_DEFAULT };
+
+    const fn pack(self) -> u32 {
+        self.mux as u32 | (self.pos as u32) << 4 | (self.neg as u32) << 8 | (self.pga as u32) << 12 | (self.rate as u32) << 16
+    }
+
+    fn unpack(v: u32) -> Self {
+        Settings {
+            mux: v & 1 != 0,
+            pos: (v >> 4 & 0xF) as u8,
+            neg: (v >> 8 & 0xF) as u8,
+            pga: (v >> 12 & 0x7) as u8,
+            rate: (v >> 16 & 0xF) as u8,
+        }
+    }
+
+    pub fn gain(&self) -> u32 {
+        1 << self.pga
+    }
+
+    /// Differential samples per second.
+    pub fn diff_sps(&self) -> u32 {
+        if self.mux { SLOT_HZ } else { RATES[self.rate as usize].0 }
+    }
+
+    /// Input (0..7, AINCOM) measured vs AINCOM on single-ended channel `ch` (CH_AIN0/1), or None
+    /// if that channel is not sampled (MUX OFF, or the input is AINCOM itself).
+    pub fn se_input(&self, ch: usize) -> Option<u8> {
+        let input = if ch == CH_AIN0 { self.pos } else { self.neg };
+        (self.mux && input != AINCOM).then_some(input)
+    }
+
+    fn diff_channel(&self) -> Channel {
+        let drate = if self.mux { DRATE_SLOT } else { RATES[self.rate as usize].1 };
+        Channel { mux: self.pos << 4 | self.neg, adcon: self.pga, drate }
     }
 }
 
-static MUX_ON: AtomicBool = AtomicBool::new(false);
-
-/// Selects MUX ON (true) or OFF; the ADC task restarts sampling in the new mode.
-pub fn set_mux(on: bool) {
-    MUX_ON.store(on, Ordering::Relaxed);
+/// "AIN0".."AIN7" or "COM".
+pub fn input_name(input: u8) -> &'static str {
+    ["AIN0", "AIN1", "AIN2", "AIN3", "AIN4", "AIN5", "AIN6", "AIN7", "COM"][input.min(AINCOM) as usize]
 }
 
-/// Mode requested with `set_mux` (`View::mux` is the mode in effect).
-pub fn mux() -> bool {
-    MUX_ON.load(Ordering::Relaxed)
+static SETTINGS: AtomicU32 = AtomicU32::new(Settings::DEFAULT.pack());
+
+/// Settings requested from the UI (`View::cfg` is what is in effect).
+pub fn settings() -> Settings {
+    Settings::unpack(SETTINGS.load(Ordering::Relaxed))
+}
+
+/// Requests new settings; the ADC task restarts with them. Invalid ones are ignored.
+pub fn set_settings(s: Settings) {
+    if s.pos <= AINCOM && s.neg <= AINCOM && s.pos != s.neg && s.pga <= PGA_MAX && (s.rate as usize) < RATES.len() {
+        SETTINGS.store(s.pack(), Ordering::Relaxed);
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Format)]
@@ -150,8 +223,8 @@ pub enum Status {
 #[derive(Clone, Copy)]
 pub struct View {
     pub status: Status,
-    /// Mode in effect: MUX ON (true) or OFF.
-    pub mux: bool,
+    /// Settings in effect (sampling restarts after `set_settings`).
+    pub cfg: Settings,
     /// Last result per channel (CH_*), in microvolts.
     pub uv: [i32; 3],
     /// Conversions read per second per channel, measured.
@@ -165,7 +238,7 @@ pub struct View {
 
 static VIEW: Mutex<CriticalSectionRawMutex, Cell<View>> = Mutex::new(Cell::new(View {
     status: Status::Starting,
-    mux: false,
+    cfg: Settings::DEFAULT,
     uv: [0; 3],
     sps: [0; 3],
     slot_us_max: 0,
@@ -185,27 +258,71 @@ fn update_view(f: impl FnOnce(&mut View)) {
     });
 }
 
-/// Differential samples (raw codes), 8.2 s at 1000 SPS. Single writer (the ADC task), any
-/// number of readers; a reader must stay well within RING_LEN of `head()`.
-pub const RING_LEN: usize = 8192;
-static RING: [AtomicI32; RING_LEN] = [const { AtomicI32::new(0) }; RING_LEN];
-/// Number of samples written so far; sample `i` lives at RING[i % RING_LEN].
-static HEAD: AtomicU32 = AtomicU32::new(0);
+/// History of raw conversion codes for one channel. Single writer (the ADC task), any number of
+/// readers; a reader must stay well within `len()` of `head()` (the writer keeps going while it
+/// reads).
+pub struct Ring {
+    buf: &'static [AtomicI32],
+    /// Number of samples written so far; sample `i` lives at buf[i % len].
+    head: AtomicU32,
+}
 
-/// Samples written so far; the newest is `head() - 1`.
+impl Ring {
+    const fn new(buf: &'static [AtomicI32]) -> Self {
+        Ring { buf, head: AtomicU32::new(0) }
+    }
+
+    /// Samples written so far; the newest is `head() - 1`.
+    pub fn head(&self) -> u32 {
+        self.head.load(Ordering::Acquire)
+    }
+
+    /// Sample `i` (raw code), for `i` in `head() - len() + margin .. head()`.
+    pub fn get(&self, i: u32) -> i32 {
+        self.buf[i as usize % self.buf.len()].load(Ordering::Relaxed)
+    }
+
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    fn push(&self, code: i32) {
+        let h = self.head.load(Ordering::Relaxed);
+        self.buf[h as usize % self.buf.len()].store(code, Ordering::Relaxed);
+        self.head.store(h.wrapping_add(1), Ordering::Release);
+    }
+}
+
+/// 16.4 s of the differential channel at 1000 SPS (the UI shows up to 12 s; less at higher
+/// rates).
+static DIFF_BUF: [AtomicI32; 16384] = [const { AtomicI32::new(0) }; 16384];
+/// 20 s of each single-ended channel at 100 SPS (MUX ON only).
+static AIN0_BUF: [AtomicI32; 2048] = [const { AtomicI32::new(0) }; 2048];
+static AIN1_BUF: [AtomicI32; 2048] = [const { AtomicI32::new(0) }; 2048];
+
+/// Sample history per channel index (CH_*).
+pub static RINGS: [Ring; 3] = [Ring::new(&DIFF_BUF), Ring::new(&AIN0_BUF), Ring::new(&AIN1_BUF)];
+
+/// Differential samples written so far (shorthand for `RINGS[CH_DIFF].head()`).
 pub fn head() -> u32 {
-    HEAD.load(Ordering::Acquire)
+    RINGS[CH_DIFF].head()
 }
 
-/// Differential sample `i` (raw code), for `i` in `head() - RING_LEN + margin .. head()`.
+/// Differential sample `i` (raw code).
 pub fn sample(i: u32) -> i32 {
-    RING[i as usize % RING_LEN].load(Ordering::Relaxed)
+    RINGS[CH_DIFF].get(i)
 }
 
-fn push(code: i32) {
-    let h = HEAD.load(Ordering::Relaxed);
-    RING[h as usize % RING_LEN].store(code, Ordering::Relaxed);
-    HEAD.store(h.wrapping_add(1), Ordering::Release);
+/// Nominal samples per second of channel `ch` with the settings in effect.
+pub fn rate(ch: usize) -> u32 {
+    if ch == CH_DIFF { view().cfg.diff_sps() } else { SLOT_HZ / SE_EVERY }
+}
+
+/// Converts a stored sample of channel `ch` (`RINGS`) to nanovolts (exact integer maths).
+/// Differential samples are stored at the gain-64 scale, single-ended ones at gain 1.
+pub fn code_to_nv(ch: usize, code: i64) -> i64 {
+    let gain = if ch == CH_DIFF { 64 } else { 1 };
+    code * 2 * VREF_UV * 1000 / (gain * (1 << 23))
 }
 
 /// Converts a signed 24-bit result to microvolts for the given gain.
@@ -219,8 +336,8 @@ enum Error {
     NotFound { status: u8 },
     DrdyTimeout,
     WriteVerify { reg: u8 },
-    /// `set_mux` asked for the other mode.
-    ModeChange,
+    /// `set_settings` asked for something else.
+    ConfigChange,
 }
 
 impl From<spi::Error> for Error {
@@ -356,21 +473,22 @@ impl Ads1256 {
         self.command(CMD_SELFCAL)?;
         // DRDY goes high while calibrating and low when done.
         let _ = with_timeout(Duration::from_millis(1), self.drdy.wait_for_high()).await;
-        with_timeout(Duration::from_millis(500), self.drdy.wait_for_low())
+        // Self-calibration takes up to ~1 s at the slowest data rates (datasheet table 21).
+        with_timeout(Duration::from_millis(2000), self.drdy.wait_for_low())
             .await
             .map_err(|_| Error::DrdyTimeout)
     }
 }
 
-/// Finds the ADS1256 and samples in the selected mode. Retries every 2 s on errors.
+/// Finds the ADS1256 and samples with the requested settings. Retries every 2 s on errors.
 #[embassy_executor::task]
 pub async fn task(mut adc: Ads1256) {
     loop {
-        let mux = mux();
-        let Err(e) = run(&mut adc, mux).await;
+        let s = settings();
+        let Err(e) = run(&mut adc, s).await;
         let status = match e {
-            Error::ModeChange => {
-                info!("ADS1256: switching to MUX {}", if mux { "OFF" } else { "ON" });
+            Error::ConfigChange => {
+                info!("ADS1256: settings changed to {}", settings());
                 update_view(|v| {
                     v.uv = [0; 3];
                     v.sps = [0; 3];
@@ -403,23 +521,32 @@ pub async fn task(mut adc: Ads1256) {
     }
 }
 
-async fn run(adc: &mut Ads1256, mux: bool) -> Result<Infallible, Error> {
+async fn run(adc: &mut Ads1256, s: Settings) -> Result<Infallible, Error> {
     let status = adc.probe().await?;
     info!("ADS1256 found, STATUS {:#04x}", status);
-    adc.calibrate(if mux { &DIFF_SLOT } else { &DIFF_CONT }).await?;
-    if mux {
-        info!("ADS1256 MUX ON: AIN0-AIN1 gain 64 at {} SPS, AIN0/AIN1-AINCOM gain 1 at {} SPS", DIFF_SPS, DIFF_SPS / SE_EVERY);
-    } else {
-        info!("ADS1256 MUX OFF: AIN0-AIN1 gain 64, continuous at {} SPS", DIFF_SPS);
-    }
+    adc.calibrate(&s.diff_channel()).await?;
+    info!(
+        "ADS1256 MUX {}: {}-{} gain {} at {} SPS",
+        if s.mux { "ON" } else { "OFF" },
+        input_name(s.pos),
+        input_name(s.neg),
+        s.gain(),
+        s.diff_sps()
+    );
     update_view(|v| {
         v.status = Status::Running;
-        v.mux = mux;
+        v.cfg = s;
         v.uv = [0; 3];
         v.slot_us_max = 0;
         v.late = 0;
     });
-    if mux { run_slots(adc).await } else { run_continuous(adc).await }
+    if s.mux { run_slots(adc, s).await } else { run_continuous(adc, s).await }
+}
+
+/// Stores a differential result: ring scaled to gain 64, view in microvolts.
+fn store_diff(code: i32, s: &Settings) {
+    RINGS[CH_DIFF].push(code << (PGA_MAX - s.pga));
+    update_view(|v| v.uv[CH_DIFF] = to_uv(code, s.gain() as u16));
 }
 
 /// Per-second rates for the view, and a log line every 5 s.
@@ -453,7 +580,7 @@ impl Stats {
             let v = view();
             if mux {
                 info!(
-                    "ADS1256: diff {} uV ({} SPS), AIN0 {} uV, AIN1 {} uV ({}/{} SPS), slot max {} us, late {}, write retries {}",
+                    "ADS1256: diff {} uV ({} SPS), SE {} uV, {} uV ({}/{} SPS), slot max {} us, late {}, write retries {}",
                     v.uv[CH_DIFF], sps[CH_DIFF], v.uv[CH_AIN0], v.uv[CH_AIN1], sps[CH_AIN0], sps[CH_AIN1], slot_max, late, retries
                 );
             } else {
@@ -468,68 +595,73 @@ impl Stats {
 }
 
 /// MUX OFF: conversions run back to back at the filter rate; each is read after DRDY falls.
-async fn run_continuous(adc: &mut Ads1256) -> Result<Infallible, Error> {
+async fn run_continuous(adc: &mut Ads1256, s: Settings) -> Result<Infallible, Error> {
     let mut st = Stats::new();
+    // The first result after start takes t18 (a few periods at the slow rates); allow 5
+    // periods plus margin.
+    let timeout = Duration::from_micros(5_000_000 / s.diff_sps() as u64 + 5_000);
     adc.start()?;
     loop {
-        // One period is 1 ms; the first result after start takes t18 = 1.18 ms.
-        adc.wait_conversion(Duration::from_millis(5)).await?;
+        adc.wait_conversion(timeout).await?;
         let code = adc.read_data()?;
-        push(code);
-        update_view(|v| v.uv[CH_DIFF] = to_uv(code, DIFF_CONT.gain));
+        store_diff(code, &s);
         st.count[CH_DIFF] += 1;
-        if mux() {
-            return Err(Error::ModeChange);
+        if settings() != s {
+            return Err(Error::ConfigChange);
         }
         st.tick(adc.retries, false);
     }
 }
 
 /// MUX ON: 1 kHz slots, see the module docs.
-async fn run_slots(adc: &mut Ads1256) -> Result<Infallible, Error> {
+async fn run_slots(adc: &mut Ads1256, s: Settings) -> Result<Infallible, Error> {
     let mut st = Stats::new();
-    let mut ticker = Ticker::every(Duration::from_hz(DIFF_SPS as u64));
+    let mut ticker = Ticker::every(Duration::from_hz(SLOT_HZ as u64));
     let mut slot = 0u32;
     let timeout = Duration::from_millis(2);
+    let diff_ch = s.diff_channel();
+    let se_ch = |ch: usize| s.se_input(ch).map(|input| (ch, Channel { mux: input << 4 | AINCOM, adcon: 0, drate: DRATE_SE }));
+    let se = [se_ch(CH_AIN0), se_ch(CH_AIN1)];
     loop {
         ticker.next().await;
         let t0 = Instant::now();
 
-        // The multiplexer is on DIFF_SLOT here (set by calibrate or at the end of the last slot).
+        // The multiplexer is on the differential pair here (set by calibrate or at the end of
+        // the last slot).
         adc.start()?;
         adc.wait_conversion(timeout).await?;
-        let se = match slot % SE_EVERY {
-            0 => Some((CH_AIN0, &AIN0_SE)),
-            s if s == SE_EVERY / 2 => Some((CH_AIN1, &AIN1_SE)),
+        let this_se = match slot % SE_EVERY {
+            0 => se[0],
+            n if n == SE_EVERY / 2 => se[1],
             _ => None,
         };
-        let diff = match se {
+        let diff = match this_se {
             None => adc.read_data()?,
             Some((idx, ch)) => {
                 // Switch first, then read the differential result (datasheet figure 19).
-                adc.set_channel(ch)?;
+                adc.set_channel(&ch)?;
                 adc.start()?;
                 let diff = adc.read_data()?;
                 adc.wait_conversion(timeout).await?;
-                adc.set_channel(&DIFF_SLOT)?;
-                let uv = to_uv(adc.read_data()?, ch.gain);
-                update_view(|v| v.uv[idx] = uv);
+                adc.set_channel(&diff_ch)?;
+                let code = adc.read_data()?;
+                RINGS[idx].push(code);
+                update_view(|v| v.uv[idx] = to_uv(code, 1));
                 st.count[idx] += 1;
                 diff
             }
         };
-        push(diff);
-        update_view(|v| v.uv[CH_DIFF] = to_uv(diff, DIFF_SLOT.gain));
+        store_diff(diff, &s);
         st.count[CH_DIFF] += 1;
         slot = slot.wrapping_add(1);
 
         let us = t0.elapsed().as_micros() as u32;
         st.slot_us_max = st.slot_us_max.max(us);
-        if us >= 1_000_000 / DIFF_SPS {
+        if us >= 1_000_000 / SLOT_HZ {
             st.late += 1;
         }
-        if !mux() {
-            return Err(Error::ModeChange);
+        if settings() != s {
+            return Err(Error::ConfigChange);
         }
         st.tick(adc.retries, true);
     }
