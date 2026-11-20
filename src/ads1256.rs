@@ -33,7 +33,7 @@
 //!
 //! Every register write is read back and repeated on mismatch: on the bench wiring ~8 % of
 //! writes arrived with one bit doubled (SCLK glitch), e.g. DRATE 0xC0 -> 0x60, which stalls
-//! the conversion. `View::write_retries` counts these.
+//! the conversion. `write_retries()` counts these (RESET on the ADC tab clears it).
 //!
 //! The task runs on the high-priority interrupt executor so the ~20 ms frame draws on the main
 //! executor don't delay sampling.
@@ -249,8 +249,6 @@ pub struct View {
     /// MUX ON: longest slot in the last second, and slots that overran 1 ms since start.
     pub slot_us_max: u32,
     pub late: u32,
-    /// Register writes that read back wrong and were repeated, since boot.
-    pub write_retries: u32,
 }
 
 static VIEW: Mutex<CriticalSectionRawMutex, Cell<View>> = Mutex::new(Cell::new(View {
@@ -260,8 +258,19 @@ static VIEW: Mutex<CriticalSectionRawMutex, Cell<View>> = Mutex::new(Cell::new(V
     sps: [0; 3],
     slot_us_max: 0,
     late: 0,
-    write_retries: 0,
 }));
+
+/// Register writes that read back wrong and were repeated, since boot or the last
+/// `clear_write_retries` (RESET button on the ADC tab).
+static WRITE_RETRIES: AtomicU32 = AtomicU32::new(0);
+
+pub fn write_retries() -> u32 {
+    WRITE_RETRIES.load(Ordering::Relaxed)
+}
+
+pub fn clear_write_retries() {
+    WRITE_RETRIES.store(0, Ordering::Relaxed);
+}
 
 pub fn view() -> View {
     VIEW.lock(|v| v.get())
@@ -373,8 +382,6 @@ pub struct Ads1256 {
     spi: Spi<'static, Blocking, spi::mode::Master>,
     cs: Output<'static>,
     drdy: ExtiInput<'static, Async>,
-    /// Register writes repeated after a bad read-back.
-    retries: u32,
     /// SCLK currently configured.
     spi_hz: u32,
     /// Data rate the chip was last set to (its power-on default is 30000 SPS); sets the serial
@@ -384,7 +391,7 @@ pub struct Ads1256 {
 
 impl Ads1256 {
     pub fn new(spi: Spi<'static, Blocking, spi::mode::Master>, cs: Output<'static>, drdy: ExtiInput<'static, Async>) -> Self {
-        Ads1256 { spi, cs, drdy, retries: 0, spi_hz: SPI_SPEEDS[0].0, chip_sps: 30_000 }
+        Ads1256 { spi, cs, drdy, spi_hz: SPI_SPEEDS[0].0, chip_sps: 30_000 }
     }
 
     /// SPI settings for the ADS1256 at `hz`: mode 1 (CPOL 0, CPHA 1), MSB first, below CLKIN / 4.
@@ -462,7 +469,7 @@ impl Ads1256 {
             if got.iter().zip(&data).all(|(g, w)| g & mask == w & mask) {
                 return Ok(());
             }
-            self.retries += 1;
+            WRITE_RETRIES.fetch_add(1, Ordering::Relaxed);
         }
         Err(Error::WriteVerify { reg: first })
     }
@@ -563,7 +570,6 @@ pub async fn task(mut adc: Ads1256) {
         update_view(|v| {
             v.status = status;
             v.sps = [0; 3];
-            v.write_retries = adc.retries;
         });
         Timer::after_secs(2).await;
     }
@@ -630,7 +636,7 @@ impl Stats {
         Stats { window: Instant::now(), count: [0; 3], slot_us_max: 0, late: 0, last_log: Instant::now() }
     }
 
-    fn tick(&mut self, retries: u32, mux: bool) {
+    fn tick(&mut self, mux: bool) {
         let ms = self.window.elapsed().as_millis() as u32;
         if ms < 1000 {
             return;
@@ -641,9 +647,9 @@ impl Stats {
             v.sps = sps;
             v.slot_us_max = slot_max;
             v.late = late;
-            v.write_retries = retries;
         });
         if self.last_log.elapsed() >= Duration::from_secs(5) {
+            let retries = write_retries();
             let v = view();
             if mux {
                 info!(
@@ -676,7 +682,7 @@ async fn run_continuous(adc: &mut Ads1256, s: Settings) -> Result<Infallible, Er
         if settings() != s {
             return Err(Error::ConfigChange);
         }
-        st.tick(adc.retries, false);
+        st.tick(false);
     }
 }
 
@@ -730,6 +736,6 @@ async fn run_slots(adc: &mut Ads1256, s: Settings) -> Result<Infallible, Error> 
         if settings() != s {
             return Err(Error::ConfigChange);
         }
-        st.tick(adc.retries, true);
+        st.tick(true);
     }
 }

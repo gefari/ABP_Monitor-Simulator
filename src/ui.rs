@@ -5,7 +5,7 @@
 //! - Motor Test: speed setpoint with -/+ (tap = 10 rpm, hold to repeat), Start and Stop.
 //! - ADC: input pair, gain, data rate and MUX ON/OFF; ADS1256 channels, measured rates, last
 //!   readings with peak-peak and std dev over the Monitor time window, slot timing and register
-//!   write retries.
+//!   write retries (RESET clears the count).
 
 use core::fmt::Write;
 
@@ -75,6 +75,8 @@ const BTN_GAIN: Rectangle = Rectangle::new(Point::new(218, SET_Y), Size::new(99,
 const BTN_RATE: Rectangle = Rectangle::new(Point::new(323, SET_Y), Size::new(99, 44));
 const BTN_SPI: Rectangle = Rectangle::new(Point::new(428, SET_Y), Size::new(99, 44));
 const BTN_MUX: Rectangle = Rectangle::new(Point::new(533, SET_Y), Size::new(99, 44));
+/// Clears the register write retry counter (on the counter's line).
+const BTN_CLR_RETRIES: Rectangle = Rectangle::new(Point::new(533, 374), Size::new(99, 30));
 
 // Header tabs
 const TAB_MONITOR: Rectangle = Rectangle::new(Point::new(222, 6), Size::new(110, 32));
@@ -125,6 +127,10 @@ fn hit(r: &Rectangle, p: Option<Point>) -> bool {
 
 /// ADC tab settings row: the left half of a setting steps down, the right half up.
 fn adc_touch(p: Point) {
+    if BTN_CLR_RETRIES.contains(p) {
+        ads1256::clear_write_retries();
+        return;
+    }
     let mut s = ads1256::settings();
     let step = |r: &Rectangle| if p.x < r.center().x { -1 } else { 1 };
     // Inputs wrap around AIN0..AIN7, COM, skipping the other input of the pair.
@@ -414,9 +420,11 @@ impl Ui {
             Text::new("No ADC: see src/ads1256.rs for wiring", Point::new(10, y + 28), small).draw(d)?;
         }
         let mut w = Buf::<40>::new();
-        let _ = write!(w, "Register write retries {}", av.write_retries);
-        Text::new(w.as_str(), Point::new(10, y + 56), if av.write_retries > 0 { MonoTextStyle::new(&FONT_10X20, warn) } else { small })
+        let retries = ads1256::write_retries();
+        let _ = write!(w, "Register write retries {}", retries);
+        Text::new(w.as_str(), Point::new(10, y + 56), if retries > 0 { MonoTextStyle::new(&FONT_10X20, warn) } else { small })
             .draw(d)?;
+        self.button(d, &BTN_CLR_RETRIES, "RESET", if retries > 0 { ACCENT } else { DISABLED })?;
 
         let note = MonoTextStyle::new(&FONT_6X10, LABEL);
         let mut mode = Buf::<112>::new();
