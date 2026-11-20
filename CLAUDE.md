@@ -41,7 +41,8 @@ The GitHub CLI `gh` is not installed on this PC; use plain `git push`/`git pull`
   (4 s window), voltages of the pair's inputs vs COM.
 - ADC settings, changed at runtime on the ADC tab (`ads1256::set_settings`; any change restarts with a
   new self-cal): differential pair IN+/IN- (AIN0..7, COM; default AIN0-AIN1), gain 1..64 (default 64),
-  rate 5..7500 SPS (MUX OFF only, default 1000), and the mode:
+  rate 5..7500 SPS (MUX OFF only, default 1000), SPI SCLK 1688k/844k/422k/211k (MUX OFF only; MUX ON
+  forced to 1688k because its slots overrun at 844k), and the mode:
   - MUX OFF: the pair only, continuous conversion at the selected rate (registers written once).
   - MUX ON: 1 kHz slots, the pair at DRATE 3750 + IN+/IN- vs AINCOM at 100 SPS each.
   Verified on hardware 2026-11-20: 5, 1000, 7500 SPS (7500: UI drops to ~12 fps), MUX ON slot max
@@ -53,8 +54,18 @@ The GitHub CLI `gh` is not installed on this PC; use plain `git push`/`git pull`
   SCLK, 33-100 ohm series resistor at CN6-23. After a later re-wiring a 40 s run showed 0 retries.
 - Change ADC settings without touching the screen: `probe-rs write --chip STM32F746NGHx b32 <addr> <word>`
   with the address of `ads1256::SETTINGS` from `llvm-nm` (in `~/.rustup/toolchains/*/lib/rustlib/*/bin`).
-  Word = mux | pos<<4 | neg<<8 | pga<<12 | rate_index<<16; default 0x00096100. `probe-rs reset`
+  Word = mux | pos<<4 | neg<<8 | pga<<12 | rate_index<<16 | spi_index<<20; default 0x00096100. `probe-rs reset`
   did NOT restore the default here (value survived), so write the default back after testing.
+- SCLK speed findings (2026-11-20): slower SCLK did NOT reduce write corruption (more retries at 844k
+  than 1688k). After an SCLK change the chip is sometimes a bit out of step (STATUS 0x30 read as 0x60);
+  `run()` waits 32 DRDY periods (datasheet serial-interface timeout) and retries, but switching to 211k
+  still took up to ~10 s once. Rates verified: 844k @ 7500 SPS, 211k @ 2000 SPS.
+- DMA evaluated and not used: transfers are 1-5 bytes, t6/t10/t11 waits stay busy-waits, MUX ON slots
+  (~956 us of 1000) would get slower, and D-cache is on with no cache maintenance in embassy SPI DMA
+  (buffers would need DTCM or non-cacheable SDRAM). Worth it only for 15-30 kSPS: RDATAC + 3-byte DMA
+  read started from the DRDY EXTI handler.
+- Firmware version (Cargo.toml) + git commit (`build.rs`, `GIT_VERSION`; `*` = dirty) shown top right
+  and in the boot log. build.rs finds git at `C:/Program Files/Git/cmd/git.exe` (not on PowerShell PATH).
 - `JtagGetIdcodeError` with the board powered (LCD blank, chip not running) cleared after the user
   reworked the ADS1256 wiring/power; check the module wiring and power-up order first when it appears.
 

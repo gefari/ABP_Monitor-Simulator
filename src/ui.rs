@@ -69,16 +69,21 @@ const BTN_AUTO: Rectangle = Rectangle::new(Point::new(512, 436), Size::new(120, 
 
 // ADC page: settings row
 const SET_Y: i32 = 266;
-const BTN_POS: Rectangle = Rectangle::new(Point::new(8, SET_Y), Size::new(116, 44));
-const BTN_NEG: Rectangle = Rectangle::new(Point::new(132, SET_Y), Size::new(116, 44));
-const BTN_GAIN: Rectangle = Rectangle::new(Point::new(256, SET_Y), Size::new(116, 44));
-const BTN_RATE: Rectangle = Rectangle::new(Point::new(380, SET_Y), Size::new(116, 44));
-const BTN_MUX: Rectangle = Rectangle::new(Point::new(504, SET_Y), Size::new(128, 44));
+const BTN_POS: Rectangle = Rectangle::new(Point::new(8, SET_Y), Size::new(99, 44));
+const BTN_NEG: Rectangle = Rectangle::new(Point::new(113, SET_Y), Size::new(99, 44));
+const BTN_GAIN: Rectangle = Rectangle::new(Point::new(218, SET_Y), Size::new(99, 44));
+const BTN_RATE: Rectangle = Rectangle::new(Point::new(323, SET_Y), Size::new(99, 44));
+const BTN_SPI: Rectangle = Rectangle::new(Point::new(428, SET_Y), Size::new(99, 44));
+const BTN_MUX: Rectangle = Rectangle::new(Point::new(533, SET_Y), Size::new(99, 44));
 
 // Header tabs
-const TAB_MONITOR: Rectangle = Rectangle::new(Point::new(280, 6), Size::new(110, 32));
-const TAB_MOTOR: Rectangle = Rectangle::new(Point::new(400, 6), Size::new(110, 32));
-const TAB_ADC: Rectangle = Rectangle::new(Point::new(520, 6), Size::new(110, 32));
+const TAB_MONITOR: Rectangle = Rectangle::new(Point::new(222, 6), Size::new(110, 32));
+const TAB_MOTOR: Rectangle = Rectangle::new(Point::new(342, 6), Size::new(110, 32));
+const TAB_ADC: Rectangle = Rectangle::new(Point::new(462, 6), Size::new(110, 32));
+
+/// Firmware version (Cargo.toml) and git commit (build.rs), top right of the header.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const GIT_VERSION: &str = env!("GIT_VERSION");
 
 // Motor Test page
 const BTN_MINUS: Rectangle = Rectangle::new(Point::new(130, 130), Size::new(90, 90));
@@ -140,6 +145,9 @@ fn adc_touch(p: Point) {
         s.pga = (s.pga as i32 + step(&BTN_GAIN)).clamp(0, ads1256::PGA_MAX as i32) as u8;
     } else if BTN_RATE.contains(p) && !s.mux {
         s.rate = (s.rate as i32 + step(&BTN_RATE)).clamp(0, ads1256::RATES.len() as i32 - 1) as u8;
+    } else if BTN_SPI.contains(p) && !s.mux {
+        // Left half = slower, right half = faster (SPI_SPEEDS runs fast to slow).
+        s.spi = (s.spi as i32 - step(&BTN_SPI)).clamp(0, ads1256::SPI_SPEEDS.len() as i32 - 1) as u8;
     } else if BTN_MUX.contains(p) {
         s.mux = !s.mux;
     } else {
@@ -260,6 +268,17 @@ impl Ui {
             .into_styled(PrimitiveStyle::with_fill(HEADER))
             .draw(d)?;
         Text::new("ABP Simulator", Point::new(14, 29), MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE)).draw(d)?;
+        // Version, two small lines: "v0.1.0" and the commit ("ffbcdd2", "*" = uncommitted changes).
+        let ver_style = MonoTextStyle::new(&FONT_6X10, LABEL);
+        let mut v = Buf::<12>::new();
+        let _ = write!(v, "v{}", VERSION);
+        Text::with_alignment(v.as_str(), Point::new(WIDTH as i32 - 6, 19), ver_style, Alignment::Right).draw(d)?;
+        let mut g = Buf::<12>::new();
+        let _ = match GIT_VERSION.strip_suffix("-dirty") {
+            Some(hash) => write!(g, "{}*", hash),
+            None => g.write_str(GIT_VERSION),
+        };
+        Text::with_alignment(g.as_str(), Point::new(WIDTH as i32 - 6, 33), ver_style, Alignment::Right).draw(d)?;
         self.tab_button(d, &TAB_MONITOR, "Monitor", Tab::Monitor)?;
         self.tab_button(d, &TAB_MOTOR, "Motor Test", Tab::Motor)?;
         self.tab_button(d, &TAB_ADC, "ADC", Tab::Adc)?;
@@ -276,7 +295,9 @@ impl Ui {
         let small = MonoTextStyle::new(&FONT_10X20, LABEL);
         let white = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
 
-        Text::new("ADS1256  SPI2", Point::new(40, 80), small).draw(d)?;
+        let mut hdr = Buf::<32>::new();
+        let _ = write!(hdr, "ADS1256  SPI2  SCLK {}Hz", av.cfg.spi_speed().1);
+        Text::new(hdr.as_str(), Point::new(10, 80), small).draw(d)?;
         let warn = Rgb565::new(31, 40, 0);
         let (state, color) = match av.status {
             ads1256::Status::Starting => ("STARTING", LABEL),
@@ -367,6 +388,7 @@ impl Ui {
         self.stepper(d, &BTN_NEG, "IN-", ads1256::input_name(want.neg), true)?;
         self.stepper(d, &BTN_GAIN, "GAIN (diff)", gain.as_str(), true)?;
         self.stepper(d, &BTN_RATE, if want.mux { "RATE (fixed)" } else { "RATE" }, rate.as_str(), !want.mux)?;
+        self.stepper(d, &BTN_SPI, if want.mux { "SCLK (fixed)" } else { "SPI SCLK" }, want.spi_speed().1, !want.mux)?;
         Text::new("MODE", Point::new(BTN_MUX.top_left.x, BTN_MUX.top_left.y - 6), MonoTextStyle::new(&FONT_6X10, LABEL))
             .draw(d)?;
         self.button(d, &BTN_MUX, if want.mux { "MUX ON" } else { "MUX OFF" }, if want.mux { GREEN } else { ACCENT })?;
@@ -406,7 +428,7 @@ impl Ui {
         for (k, line) in [
             mode.as_str(),
             "Buffer on: inputs 0..3 V. AINCOM is tied to GND. Self-calibrated at the selected gain and rate.",
-            "Pressure: 25 uV/mmHg (5 uV/V/mmHg at 5 V). Write retries > 0: check the SCLK wiring.",
+            "Pressure 25 uV/mmHg. Slow SCLK lengthens reads (211k: up to ~2000 SPS). Retries > 0: check SCLK.",
         ]
         .iter()
         .enumerate()

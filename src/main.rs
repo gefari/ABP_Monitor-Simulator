@@ -95,7 +95,7 @@ async fn blink(pin: Peri<'static, embassy_stm32::gpio::AnyPin>, period_ms: u64) 
 async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(clock_config());
     enable_caches();
-    info!("ABP simulator starting on STM32F746NG");
+    info!("ABP simulator v{} ({}) starting on STM32F746NG", ui::VERSION, ui::GIT_VERSION);
 
     let sdram = sdram::init(sdram::SdramPins {
         fmc: p.FMC,
@@ -178,7 +178,7 @@ async fn main(spawner: Spawner) {
 
     // ADS1256 on SPI2 (pinout in ads1256.rs), sampled on the high-priority executor.
     let adc = ads1256::Ads1256::new(
-        Spi::new_blocking(p.SPI2, p.PD3, p.PB15, p.PB14, ads1256::Ads1256::spi_config()),
+        Spi::new_blocking(p.SPI2, p.PD3, p.PB15, p.PB14, ads1256::Ads1256::spi_config(ads1256::SPI_SPEEDS[0].0)),
         Output::new(p.PA4, Level::High, Speed::Medium),
         ExtiInput::new(p.PC11, p.EXTI11, Pull::Up, Irqs),
     );

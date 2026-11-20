@@ -39,7 +39,7 @@ If you stop `cargo run` / `probe-rs` by killing it, the firmware freezes a few s
 
 ## Screen
 
-Three tabs in the header.
+Three tabs in the header. The firmware version and git commit are shown at the top right (`*` after the commit = built with uncommitted changes).
 
 ### Monitor
 
@@ -62,6 +62,7 @@ Speed setpoint with − / + (tap = 10 rpm, hold to repeat), Start and Stop.
   | IN+ / IN- | AIN0..AIN7, COM (never the same) | AIN0 / AIN1 |
   | GAIN (diff) | x1..x64 | x64 (±78 mV full scale) |
   | RATE | 5..7500 SPS, MUX OFF only | 1000 SPS |
+  | SPI SCLK | 1688k, 844k, 422k, 211k; MUX OFF only (MUX ON uses 1688k) | 1688k |
   | MUX | OFF / ON | OFF |
 
 - **MUX OFF**: only the differential pair, converting continuously at the selected rate.

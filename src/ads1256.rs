@@ -53,7 +53,13 @@ use embassy_time::{with_timeout, Duration, Instant, Ticker, Timer};
 
 /// Crystal on the module. SCLK must stay below CLKIN / 4 = 1.92 MHz.
 const CLKIN_HZ: u32 = 7_680_000;
-pub const SPI_HZ: u32 = 1_800_000; // SPI2 on APB1 (54 MHz) / 32 = 1.69 MHz
+/// Selectable SCLK rates: (requested Hz, label of what SPI2 really makes). SPI2 runs from APB1
+/// (54 MHz) through a power-of-two divider, so the requests land on /32, /64, /128, /256.
+/// /16 (3.4 MHz) would exceed CLKIN / 4. Slower clocks lengthen every transfer: a 32-bit read
+/// takes ~19 us at 1.69 MHz and ~150 us at 211 kHz, which limits the usable data rate. MUX ON
+/// always uses the fastest (see `Settings::spi_speed`).
+pub const SPI_SPEEDS: [(u32, &str); 4] =
+    [(1_800_000, "1688k"), (900_000, "844k"), (450_000, "422k"), (225_000, "211k")];
 /// Reference voltage in microvolts; full scale is +-2 * VREF / gain.
 const VREF_UV: i64 = 2_500_000;
 
@@ -147,13 +153,15 @@ pub struct Settings {
     pub pga: u8,
     /// Index into RATES (MUX OFF only; MUX ON always runs at SLOT_HZ).
     pub rate: u8,
+    /// Index into SPI_SPEEDS.
+    pub spi: u8,
 }
 
 impl Settings {
-    const DEFAULT: Settings = Settings { mux: false, pos: 0, neg: 1, pga: PGA_MAX, rate: RATE_DEFAULT };
+    const DEFAULT: Settings = Settings { mux: false, pos: 0, neg: 1, pga: PGA_MAX, rate: RATE_DEFAULT, spi: 0 };
 
     const fn pack(self) -> u32 {
-        self.mux as u32 | (self.pos as u32) << 4 | (self.neg as u32) << 8 | (self.pga as u32) << 12 | (self.rate as u32) << 16
+        self.mux as u32 | (self.pos as u32) << 4 | (self.neg as u32) << 8 | (self.pga as u32) << 12 | (self.rate as u32) << 16 | (self.spi as u32) << 20
     }
 
     fn unpack(v: u32) -> Self {
@@ -163,6 +171,7 @@ impl Settings {
             neg: (v >> 8 & 0xF) as u8,
             pga: (v >> 12 & 0x7) as u8,
             rate: (v >> 16 & 0xF) as u8,
+            spi: (v >> 20 & 0x3) as u8,
         }
     }
 
@@ -171,6 +180,12 @@ impl Settings {
     }
 
     /// Differential samples per second.
+    /// SCLK in use: the selected one in MUX OFF; MUX ON always runs at the fastest, because
+    /// its 1 ms slots already overrun at 844 kHz (measured).
+    pub fn spi_speed(&self) -> (u32, &'static str) {
+        SPI_SPEEDS[if self.mux { 0 } else { self.spi as usize }]
+    }
+
     pub fn diff_sps(&self) -> u32 {
         if self.mux { SLOT_HZ } else { RATES[self.rate as usize].0 }
     }
@@ -202,7 +217,9 @@ pub fn settings() -> Settings {
 
 /// Requests new settings; the ADC task restarts with them. Invalid ones are ignored.
 pub fn set_settings(s: Settings) {
-    if s.pos <= AINCOM && s.neg <= AINCOM && s.pos != s.neg && s.pga <= PGA_MAX && (s.rate as usize) < RATES.len() {
+    if s.pos <= AINCOM && s.neg <= AINCOM && s.pos != s.neg && s.pga <= PGA_MAX && (s.rate as usize) < RATES.len()
+        && (s.spi as usize) < SPI_SPEEDS.len()
+    {
         SETTINGS.store(s.pack(), Ordering::Relaxed);
     }
 }
@@ -358,23 +375,48 @@ pub struct Ads1256 {
     drdy: ExtiInput<'static, Async>,
     /// Register writes repeated after a bad read-back.
     retries: u32,
+    /// SCLK currently configured.
+    spi_hz: u32,
+    /// Data rate the chip was last set to (its power-on default is 30000 SPS); sets the serial
+    /// interface timeout below.
+    chip_sps: u32,
 }
 
 impl Ads1256 {
     pub fn new(spi: Spi<'static, Blocking, spi::mode::Master>, cs: Output<'static>, drdy: ExtiInput<'static, Async>) -> Self {
-        Ads1256 { spi, cs, drdy, retries: 0 }
+        Ads1256 { spi, cs, drdy, retries: 0, spi_hz: SPI_SPEEDS[0].0, chip_sps: 30_000 }
     }
 
-    /// SPI settings for the ADS1256: mode 1 (CPOL 0, CPHA 1), MSB first, below CLKIN / 4.
-    pub fn spi_config() -> spi::Config {
+    /// SPI settings for the ADS1256 at `hz`: mode 1 (CPOL 0, CPHA 1), MSB first, below CLKIN / 4.
+    pub fn spi_config(hz: u32) -> spi::Config {
         let mut c = spi::Config::default();
         c.mode = spi::MODE_1;
-        c.frequency = embassy_stm32::time::Hertz(SPI_HZ);
+        c.frequency = embassy_stm32::time::Hertz(hz);
         // Reads 0x00 instead of noise when nothing is connected, so probing fails cleanly.
         c.miso_pull = embassy_stm32::gpio::Pull::Down;
         // Slowest edges: the module hangs on jumper wires.
         c.gpio_speed = embassy_stm32::gpio::Speed::Low;
         c
+    }
+
+    /// Changes SCLK, then clocks one dummy byte with CS high (ignored by the ADS1256) so the
+    /// SPI peripheral settles at the new rate before the next real transfer.
+    /// Returns whether the rate changed.
+    fn set_spi_hz(&mut self, hz: u32) -> Result<bool, Error> {
+        if hz == self.spi_hz {
+            return Ok(false);
+        }
+        self.spi.set_config(&Ads1256::spi_config(hz)).map_err(|_| Error::Spi)?;
+        self.spi.blocking_write(&[0u8])?;
+        self.spi_hz = hz;
+        Ok(true)
+    }
+
+    /// Waits until the ADS1256 serial interface has timed out and resynchronised: SCLK idle
+    /// low for 32 DRDY periods (datasheet "Serial Clock (SCLK)"). After an SCLK rate change
+    /// the chip was seen one bit out of step (STATUS 0x30 read as 0x60).
+    async fn resync(&mut self) {
+        Timer::after_micros(32 * 1_000_000 / self.chip_sps as u64 + 5_000).await;
     }
 
     /// Runs `f` with CS low; keeps CS low for t10 (8 tCLKIN) after the last clock.
@@ -437,7 +479,12 @@ impl Ads1256 {
     }
 
     fn set_channel(&mut self, ch: &Channel) -> Result<(), Error> {
-        self.write_verified(REG_MUX, [ch.mux, ch.adcon, ch.drate], 0xFF)
+        self.write_verified(REG_MUX, [ch.mux, ch.adcon, ch.drate], 0xFF)?;
+        self.chip_sps = match ch.drate {
+            DRATE_SE => 15_000,
+            d => RATES.iter().find(|r| r.1 == d).map_or(30_000, |r| r.0),
+        };
+        Ok(())
     }
 
     /// Restarts the digital filter: the conversion starts now and settles in one cycle.
@@ -461,6 +508,7 @@ impl Ads1256 {
         if status[0] >> 4 != ID_ADS1256 {
             return Err(Error::NotFound { status: status[0] });
         }
+        self.chip_sps = 30_000; // RESET restores DRATE 0xF0
         Ok(status[0])
     }
 
@@ -522,16 +570,35 @@ pub async fn task(mut adc: Ads1256) {
 }
 
 async fn run(adc: &mut Ads1256, s: Settings) -> Result<Infallible, Error> {
-    let status = adc.probe().await?;
-    info!("ADS1256 found, STATUS {:#04x}", status);
-    adc.calibrate(&s.diff_channel()).await?;
+    if adc.set_spi_hz(s.spi_speed().0)? {
+        adc.resync().await;
+    }
+    // After an SCLK change the probe or the first register writes can fail (interface out of
+    // step): wait for the interface timeout and retry, instead of the task's 2 s retry.
+    let mut tries = 0;
+    loop {
+        let r = async {
+            let status = adc.probe().await?;
+            info!("ADS1256 found, STATUS {:#04x}", status);
+            adc.calibrate(&s.diff_channel()).await
+        }
+        .await;
+        match r {
+            Err(Error::NotFound { .. } | Error::WriteVerify { .. }) if tries < 3 => {
+                tries += 1;
+                adc.resync().await;
+            }
+            r => break r?,
+        }
+    }
     info!(
-        "ADS1256 MUX {}: {}-{} gain {} at {} SPS",
+        "ADS1256 MUX {}: {}-{} gain {} at {} SPS, SCLK {}",
         if s.mux { "ON" } else { "OFF" },
         input_name(s.pos),
         input_name(s.neg),
         s.gain(),
-        s.diff_sps()
+        s.diff_sps(),
+        s.spi_speed().1
     );
     update_view(|v| {
         v.status = Status::Running;
